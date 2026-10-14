@@ -17,6 +17,8 @@
     "type": "git",
     "url": "git+https://github.com/hideokamoto/opennext-r2-janitor.git"
   },
+  "homepage": "https://github.com/hideokamoto/opennext-r2-janitor#readme",
+  "bugs": "https://github.com/hideokamoto/opennext-r2-janitor/issues",
   "type": "module",
   "exports": {
     ".": {
