@@ -36,16 +36,23 @@
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "lint": "biome check --write .",
-    "lint:check": "biome check .",
-    "prepublishOnly": "npm run lint:check && npm run typecheck && npm test && npm run build"
+    "lint": "biome check .",
+    "lint:fix": "biome check --write .",
+    "prepare": "husky"
   },
   "devDependencies": {
     "@biomejs/biome": "2.3.15",
+    "@commitlint/cli": "^21.2.3",
+    "@commitlint/config-conventional": "^21.2.3",
+    "husky": "^9.1.7",
     "typescript": "5.9.3",
     "vitest": "4.1.11"
   },
   "engines": {
     "node": ">=20"
+  },
+  "packageManager": "pnpm@11.24.0",
+  "publishConfig": {
+    "access": "public"
   }
 }
