@@ -48,15 +48,21 @@ export async function resolveBuildIdFromWorker(
 /**
  * Reads the build ID a deployed OpenNext site serves at `/BUILD_ID`.
  * Intended for a standalone janitor worker that cleans buckets of other sites.
- * Returns `null` on a network error, a non-2xx response or an unexpected body.
+ * Returns `null` on a network error, a timeout, a non-2xx response or an unexpected body.
+ * The request is aborted after `timeoutMs` (default 10 s) so an unresponsive site cannot stall
+ * the whole scheduled run.
  */
 export async function fetchBuildIdFromSite(
   siteUrl: string,
   fetchImpl: typeof fetch = fetch,
+  timeoutMs = 10_000,
 ): Promise<string | null> {
   const url = new URL('/BUILD_ID', siteUrl)
   try {
-    const res = await fetchImpl(url.toString(), { redirect: 'follow' })
+    const res = await fetchImpl(url.toString(), {
+      redirect: 'follow',
+      signal: AbortSignal.timeout(timeoutMs),
+    })
     if (!res.ok) return null
     const text = (await res.text()).trim()
     return isValidBuildId(text) ? text : null

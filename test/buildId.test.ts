@@ -58,7 +58,10 @@ describe('fetchBuildIdFromSite', () => {
   it('reads /BUILD_ID from the site origin', async () => {
     const fetchImpl = vi.fn(async () => new Response('abc123\n'))
     expect(await fetchBuildIdFromSite('https://example.com/some/page', fetchImpl)).toBe('abc123')
-    expect(fetchImpl).toHaveBeenCalledWith('https://example.com/BUILD_ID', { redirect: 'follow' })
+    expect(fetchImpl).toHaveBeenCalledWith('https://example.com/BUILD_ID', {
+      redirect: 'follow',
+      signal: expect.any(AbortSignal),
+    })
   })
 
   it('returns null when the request fails or the body cannot be read', async () => {
@@ -70,6 +73,14 @@ describe('fetchBuildIdFromSite', () => {
     const brokenBody = async () =>
       ({ ok: true, text: () => Promise.reject(new Error('stream broke')) }) as unknown as Response
     expect(await fetchBuildIdFromSite('https://example.com', brokenBody)).toBeNull()
+  })
+
+  it('returns null when the site does not respond within the timeout', async () => {
+    const hang = (_url: string | URL | Request, init?: RequestInit) =>
+      new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(init.signal?.reason))
+      })
+    expect(await fetchBuildIdFromSite('https://example.com', hang as typeof fetch, 20)).toBeNull()
   })
 
   it('returns null for an error status or an HTML body', async () => {
