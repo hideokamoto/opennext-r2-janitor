@@ -31,7 +31,7 @@ Safety rails:
 - **Aborts if the current build ID is not in the bucket.** That means a wrong prefix or a wrong build ID, so nothing is touched.
 - **Aborts on an unexpected layout.** If any object sits directly under the prefix instead of in a `<buildId>/` folder, the run stops. This guards against a future OpenNext key format change.
 - **Refuses an unreadable state object.** The state records which builds were recently current. If it exists but cannot be parsed, the run aborts instead of treating it as empty, because that could delete a build that should have been kept.
-- **All or nothing per build.** A build's whole folder is listed before anything in it is deleted, so a build with a single recent object is left untouched. The delete phase checks every page again.
+- **Scan before delete.** A build's whole folder is listed before anything in it is deleted, so a build with a single recent object is left untouched. The delete phase checks every page again. Deleting itself can span several runs, and it stops if a recent object shows up meanwhile, so a half-deleted build can remain; such a build is neither current nor recently used.
 - **Bounded per run.** At most `maxSubrequests` R2 calls per run (default 40, under the Workers Free plan limit of 50 subrequests). When the budget runs out, the progress (the list cursor, or how far deletion got) is saved in the state object and the next run continues from it, so a build folder of any size is eventually handled.
 
 ## Install
