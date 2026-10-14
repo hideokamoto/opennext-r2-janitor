@@ -177,6 +177,10 @@ All sites share one invocation's subrequest limit, and each `fetchBuildIdFromSit
 - **Free plan CPU.** Cron invocations on Workers Free get 10 ms of CPU time. This has not been measured for large buckets; if runs are cut off, lower `maxSubrequests`.
 - **Builds from before the janitor was installed** have no state entry, so they are kept only if they were written to within `keepDays`. Check the first dry-run report for builds you may still want to roll back to.
 
+## Releasing
+
+Releases are automated. Merging Conventional Commits (`feat:`, `fix:`, …) to `main` runs semantic-release on CircleCI, which tags the version and publishes to npm through Trusted Publishing. Commits such as `docs:` or `chore:` do not trigger a release.
+
 ## License
 
 MIT
