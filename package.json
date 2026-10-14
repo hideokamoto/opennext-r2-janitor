@@ -1,0 +1,49 @@
+{
+  "name": "opennext-r2-janitor",
+  "version": "0.1.0",
+  "description": "Delete stale per-build incremental cache entries that OpenNext for Cloudflare leaves behind in R2",
+  "keywords": [
+    "opennext",
+    "cloudflare",
+    "workers",
+    "r2",
+    "nextjs",
+    "isr",
+    "cache"
+  ],
+  "license": "MIT",
+  "author": "Hidetaka Okamoto",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hideokamoto/opennext-r2-janitor.git"
+  },
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "lint": "biome check --write .",
+    "lint:check": "biome check .",
+    "prepublishOnly": "npm run lint:check && npm run typecheck && npm test && npm run build"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.3.15",
+    "typescript": "5.9.3",
+    "vitest": "4.0.16"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
