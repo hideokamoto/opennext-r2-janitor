@@ -31,11 +31,15 @@ export async function resolveBuildIdFromWorker(
   if (isValidBuildId(fromEnv)) return fromEnv
 
   if (options.assets) {
-    // The host is ignored by the ASSETS binding; only the path matters.
-    const res = await options.assets.fetch('https://assets.local/BUILD_ID')
-    if (res.ok) {
-      const text = (await res.text()).trim()
-      if (isValidBuildId(text)) return text
+    try {
+      // The host is ignored by the ASSETS binding; only the path matters.
+      const res = await options.assets.fetch('https://assets.local/BUILD_ID')
+      if (res.ok) {
+        const text = (await res.text()).trim()
+        if (isValidBuildId(text)) return text
+      }
+    } catch {
+      // An unreadable asset is the same as an unavailable build ID.
     }
   }
   return null
@@ -44,15 +48,19 @@ export async function resolveBuildIdFromWorker(
 /**
  * Reads the build ID a deployed OpenNext site serves at `/BUILD_ID`.
  * Intended for a standalone janitor worker that cleans buckets of other sites.
- * Returns `null` on a non-2xx response or an unexpected body.
+ * Returns `null` on a network error, a non-2xx response or an unexpected body.
  */
 export async function fetchBuildIdFromSite(
   siteUrl: string,
   fetchImpl: typeof fetch = fetch,
 ): Promise<string | null> {
   const url = new URL('/BUILD_ID', siteUrl)
-  const res = await fetchImpl(url.toString(), { redirect: 'follow' })
-  if (!res.ok) return null
-  const text = (await res.text()).trim()
-  return isValidBuildId(text) ? text : null
+  try {
+    const res = await fetchImpl(url.toString(), { redirect: 'follow' })
+    if (!res.ok) return null
+    const text = (await res.text()).trim()
+    return isValidBuildId(text) ? text : null
+  } catch {
+    return null
+  }
 }

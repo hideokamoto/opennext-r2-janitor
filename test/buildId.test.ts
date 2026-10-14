@@ -33,6 +33,19 @@ describe('resolveBuildIdFromWorker', () => {
     )
   })
 
+  it('returns null when the ASSETS binding rejects or the body cannot be read', async () => {
+    vi.stubEnv('OPEN_NEXT_BUILD_ID', '')
+    const rejects = { fetch: vi.fn(async () => Promise.reject(new Error('binding down'))) }
+    const badBody = {
+      fetch: vi.fn(async () => ({
+        ok: true,
+        text: () => Promise.reject(new Error('stream broke')),
+      })),
+    }
+    expect(await resolveBuildIdFromWorker({ assets: rejects })).toBeNull()
+    expect(await resolveBuildIdFromWorker({ assets: badBody })).toBeNull()
+  })
+
   it('returns null when nothing usable is found', async () => {
     vi.stubEnv('OPEN_NEXT_BUILD_ID', '')
     expect(await resolveBuildIdFromWorker({ assets: assets(404, 'nope') })).toBeNull()
@@ -46,6 +59,17 @@ describe('fetchBuildIdFromSite', () => {
     const fetchImpl = vi.fn(async () => new Response('abc123\n'))
     expect(await fetchBuildIdFromSite('https://example.com/some/page', fetchImpl)).toBe('abc123')
     expect(fetchImpl).toHaveBeenCalledWith('https://example.com/BUILD_ID', { redirect: 'follow' })
+  })
+
+  it('returns null when the request fails or the body cannot be read', async () => {
+    expect(
+      await fetchBuildIdFromSite('https://example.com', async () =>
+        Promise.reject(new TypeError('fetch failed')),
+      ),
+    ).toBeNull()
+    const brokenBody = async () =>
+      ({ ok: true, text: () => Promise.reject(new Error('stream broke')) }) as unknown as Response
+    expect(await fetchBuildIdFromSite('https://example.com', brokenBody)).toBeNull()
   })
 
   it('returns null for an error status or an HTML body', async () => {

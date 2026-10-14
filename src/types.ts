@@ -55,6 +55,8 @@ export interface CleanupOptions {
    * Upper bound on R2 calls in one run. Each list, delete, get and put counts as one subrequest,
    * and Workers caps subrequests per invocation (50 on the Free plan). When the budget runs out the
    * run stops and the next run resumes where it left off.
+   * At least 5 (3 when `stateKey` is `null`): less cannot complete one delete round after the
+   * per-run bookkeeping, so it is rejected.
    * @default 40
    */
   maxSubrequests?: number
@@ -70,7 +72,11 @@ export interface CleanupOptions {
 
 export type KeepReason = 'current' | 'recently-current' | 'recently-written'
 
-export type AbortReason = 'invalid-build-id' | 'current-build-not-found' | 'unexpected-layout'
+export type AbortReason =
+  | 'invalid-build-id'
+  | 'current-build-not-found'
+  | 'unexpected-layout'
+  | 'unreadable-state'
 
 export interface CleanupReport {
   dryRun: boolean
@@ -83,6 +89,8 @@ export interface CleanupReport {
   deleted: { buildId: string; objects: number }[]
   /** True when the subrequest budget ran out; the next run continues. */
   pending: boolean
+  /** The build that was being scanned or deleted when the budget ran out. */
+  partial?: { buildId: string; phase: 'scan' | 'delete'; objects: number }
   subrequests: number
   aborted?: { reason: AbortReason; detail: string }
 }
@@ -93,4 +101,20 @@ export interface JanitorState {
   lastSeenCurrent: Record<string, string>
   /** Build ID to resume examining from when the previous run ran out of budget. */
   resumeAfter?: string
+  /** The build whose listing or deletion a previous run could not finish. */
+  progress?: BuildProgress
+}
+
+/**
+ * A build is handled in two phases so that it is either deleted whole or not at all:
+ * - `scan` lists the folder page by page and gives up as soon as it sees a recently written object;
+ * - `delete` runs once a full scan found nothing recent, and removes the folder 1000 keys at a time.
+ */
+export interface BuildProgress {
+  buildId: string
+  phase: 'scan' | 'delete'
+  /** Where the scan continues. Unused in the delete phase, which always lists from the start. */
+  cursor?: string
+  /** Objects scanned so far (scan) or deleted so far (delete). */
+  objects: number
 }

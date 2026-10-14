@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { cleanupOpenNextR2Cache, normalizePrefix } from '../src/cleanup.js'
+import type { CleanupReport } from '../src/types.js'
 import { addBuild, FakeBucket } from './fakeBucket.js'
 
 const NOW = new Date('2026-10-14T00:00:00Z')
@@ -257,13 +258,233 @@ describe('cleanupOpenNextR2Cache', () => {
     ).rejects.toThrow(/must not be inside/)
   })
 
-  it('treats a corrupt state object as empty', async () => {
-    const bucket = new FakeBucket()
-    addBuild(bucket, 'cur', 1, '2026-10-13T00:00:00Z')
-    bucket.add(STATE_KEY, '2026-10-01T00:00:00Z', 'not json')
+  describe('maxSubrequests', () => {
+    it.each([
+      [4, undefined],
+      [2, null],
+    ] as const)('rejects %i when stateKey is %j: a delete round would never fit', async (n, stateKey) => {
+      await expect(
+        cleanupOpenNextR2Cache({
+          bucket: new FakeBucket(),
+          currentBuildId: 'cur',
+          maxSubrequests: n,
+          ...(stateKey === null ? { stateKey } : {}),
+        }),
+      ).rejects.toThrow(/maxSubrequests must be at least/)
+    })
 
-    const report = await cleanupOpenNextR2Cache({ bucket, currentBuildId: 'cur', now: NOW })
+    it('the minimum with a state object (5) clears a multi-page build over several runs', async () => {
+      const bucket = new FakeBucket(5)
+      addBuild(bucket, 'cur', 1, '2026-10-13T00:00:00Z')
+      addBuild(bucket, 'big', 23, '2026-08-01T00:00:00Z')
+      let report = {} as CleanupReport
+      for (let i = 0; i < 40 && (i === 0 || report.pending); i++) {
+        report = await cleanupOpenNextR2Cache({
+          bucket,
+          currentBuildId: 'cur',
+          dryRun: false,
+          now: NOW,
+          maxSubrequests: 5,
+        })
+      }
+      expect(report.pending).toBe(false)
+      expect(buildIdsLeft(bucket)).toEqual(['cur'])
+    })
 
-    expect(report.aborted).toBeUndefined()
+    it('the minimum without a state object (3) clears a build that fits in one run', async () => {
+      const bucket = new FakeBucket()
+      addBuild(bucket, 'cur', 1, '2026-10-13T00:00:00Z')
+      addBuild(bucket, 'old', 3, '2026-08-01T00:00:00Z')
+      const report = await cleanupOpenNextR2Cache({
+        bucket,
+        currentBuildId: 'cur',
+        dryRun: false,
+        now: NOW,
+        maxSubrequests: 3,
+        stateKey: null,
+      })
+      expect(report.deleted).toEqual([{ buildId: 'old', objects: 3 }])
+      expect(buildIdsLeft(bucket)).toEqual(['cur'])
+    })
+
+    it('without a state object, a build that does not fit in one run is never finished', async () => {
+      const bucket = new FakeBucket(5)
+      addBuild(bucket, 'cur', 1, '2026-10-13T00:00:00Z')
+      addBuild(bucket, 'big', 23, '2026-08-01T00:00:00Z')
+      for (let i = 0; i < 5; i++) {
+        const report = await cleanupOpenNextR2Cache({
+          bucket,
+          currentBuildId: 'cur',
+          dryRun: false,
+          now: NOW,
+          maxSubrequests: 3,
+          stateKey: null,
+        })
+        expect(report.pending).toBe(true)
+      }
+      expect(buildIdsLeft(bucket)).toEqual(['big', 'cur']) // nothing half-deleted either
+    })
+  })
+
+  describe('unreadable state', () => {
+    it.each([
+      ['not json', 'not json'],
+      ['wrong version', JSON.stringify({ version: 2, lastSeenCurrent: {} })],
+      ['array', '[]'],
+      ['bad entry', JSON.stringify({ version: 1, lastSeenCurrent: { 'a/b': 'x' } })],
+      ['bad date', JSON.stringify({ version: 1, lastSeenCurrent: { a: 'yesterday' } })],
+      [
+        'bad progress',
+        JSON.stringify({ version: 1, lastSeenCurrent: {}, progress: { buildId: 'a' } }),
+      ],
+    ])('aborts without deleting when the state is %s', async (_name, body) => {
+      const bucket = new FakeBucket()
+      addBuild(bucket, 'cur', 1, '2026-10-13T00:00:00Z')
+      addBuild(bucket, 'old', 2, '2026-08-01T00:00:00Z')
+      bucket.add(STATE_KEY, '2026-10-01T00:00:00Z', body)
+
+      const report = await cleanupOpenNextR2Cache({
+        bucket,
+        currentBuildId: 'cur',
+        dryRun: false,
+        now: NOW,
+      })
+
+      expect(report.aborted?.reason).toBe('unreadable-state')
+      expect(buildIdsLeft(bucket)).toEqual(['cur', 'old'])
+      expect(bucket.objects.get(STATE_KEY)?.body).toBe(body) // left for a human to look at
+    })
+
+    it('still starts fresh when the state object does not exist', async () => {
+      const bucket = new FakeBucket()
+      addBuild(bucket, 'cur', 1, '2026-10-13T00:00:00Z')
+      const report = await cleanupOpenNextR2Cache({ bucket, currentBuildId: 'cur', now: NOW })
+      expect(report.aborted).toBeUndefined()
+    })
+  })
+
+  describe('a build folder larger than one run can list', () => {
+    // pageSize 5 and maxSubrequests 5 (4 usable): each run lists/deletes at most a couple of pages.
+    const setup = () => {
+      const bucket = new FakeBucket(5)
+      addBuild(bucket, 'cur', 1, '2026-10-13T00:00:00Z')
+      addBuild(bucket, 'big', 23, '2026-08-01T00:00:00Z')
+      addBuild(bucket, 'zzz', 3, '2026-08-01T00:00:00Z') // sorts after big
+      return bucket
+    }
+    const opts = (bucket: FakeBucket, dryRun: boolean) => ({
+      bucket,
+      currentBuildId: 'cur',
+      dryRun,
+      now: NOW,
+      maxSubrequests: 5,
+    })
+
+    it('deletes it over several runs, then goes on to the builds after it', async () => {
+      const bucket = setup()
+      const deleted: Record<string, number> = {}
+      let runs = 0
+      for (let report = { pending: true } as CleanupReport; report.pending; runs++) {
+        expect(runs).toBeLessThan(30)
+        report = await cleanupOpenNextR2Cache(opts(bucket, false))
+        expect(report.subrequests).toBeLessThanOrEqual(5)
+        for (const d of report.deleted) deleted[d.buildId] = d.objects
+      }
+      expect(runs).toBeGreaterThan(3) // it really did need multiple runs
+      expect(deleted).toEqual({ big: 23, zzz: 3 })
+      expect(buildIdsLeft(bucket)).toEqual(['cur'])
+      expect(JSON.parse(bucket.objects.get(STATE_KEY)?.body ?? '{}').progress).toBeUndefined()
+    })
+
+    it('reports the same plan in a dry run without deleting anything', async () => {
+      const bucket = setup()
+      const planned: Record<string, number> = {}
+      for (let i = 0, report = { pending: true } as CleanupReport; report.pending; i++) {
+        expect(i).toBeLessThan(30)
+        report = await cleanupOpenNextR2Cache(opts(bucket, true))
+        for (const d of report.deleted) planned[d.buildId] = d.objects
+      }
+      expect(planned).toEqual({ big: 23, zzz: 3 })
+      expect(buildIdsLeft(bucket)).toEqual(['big', 'cur', 'zzz'])
+    })
+
+    it('reports where an unfinished build stands', async () => {
+      const bucket = setup()
+      const report = await cleanupOpenNextR2Cache(opts(bucket, false))
+      expect(report.pending).toBe(true)
+      expect(report.partial).toMatchObject({ buildId: 'big', phase: 'scan' })
+    })
+
+    it('keeps the whole build when a recent object shows up late in the scan', async () => {
+      const bucket = setup()
+      await cleanupOpenNextR2Cache(opts(bucket, false)) // scans the first pages only
+      bucket.add('incremental-cache/big/zzzzz.cache', '2026-10-13T12:00:00Z')
+
+      let last = {} as CleanupReport
+      for (let i = 0; i < 30 && (i === 0 || last.pending); i++) {
+        last = await cleanupOpenNextR2Cache(opts(bucket, false))
+      }
+
+      expect(buildIdsLeft(bucket)).toEqual(['big', 'cur'])
+      expect(bucket.keys().filter((k) => k.startsWith('incremental-cache/big/'))).toHaveLength(24)
+    })
+
+    it('stops deleting when an object is written after the scan finished', async () => {
+      const bucket = setup()
+      // Drive the build to the delete phase, then stop before it is emptied.
+      for (let i = 0; i < 30; i++) {
+        await cleanupOpenNextR2Cache(opts(bucket, false))
+        const state = JSON.parse(bucket.objects.get(STATE_KEY)?.body ?? '{}')
+        if (state.progress?.phase === 'delete') break
+      }
+      bucket.add('incremental-cache/big/00000.cache', '2026-10-13T12:00:00Z') // overwritten, now recent
+
+      for (let i = 0, r = { pending: true } as CleanupReport; r.pending && i < 30; i++) {
+        r = await cleanupOpenNextR2Cache(opts(bucket, false))
+      }
+
+      expect(bucket.objects.has('incremental-cache/big/00000.cache')).toBe(true)
+      expect(JSON.parse(bucket.objects.get(STATE_KEY)?.body ?? '{}').progress).toBeUndefined()
+    })
+
+    it('discards a saved cursor the backend rejects, then recovers on the next run', async () => {
+      const bucket = setup()
+      bucket.add(
+        STATE_KEY,
+        '2026-10-01T00:00:00Z',
+        JSON.stringify({
+          version: 1,
+          lastSeenCurrent: {},
+          progress: { buildId: 'big', phase: 'scan', cursor: 'garbage', objects: 5 },
+        }),
+      )
+
+      await expect(cleanupOpenNextR2Cache(opts(bucket, false))).rejects.toThrow(/invalid cursor/)
+      expect(JSON.parse(bucket.objects.get(STATE_KEY)?.body ?? '{}').progress).toBeUndefined()
+
+      for (let i = 0, r = { pending: true } as CleanupReport; r.pending && i < 30; i++) {
+        r = await cleanupOpenNextR2Cache(opts(bucket, false))
+      }
+      expect(buildIdsLeft(bucket)).toEqual(['cur'])
+    })
+
+    it('forgets progress for a build that has disappeared', async () => {
+      const bucket = new FakeBucket()
+      addBuild(bucket, 'cur', 1, '2026-10-13T00:00:00Z')
+      bucket.add(
+        STATE_KEY,
+        '2026-10-01T00:00:00Z',
+        JSON.stringify({
+          version: 1,
+          lastSeenCurrent: {},
+          progress: { buildId: 'gone', phase: 'delete', objects: 40 },
+        }),
+      )
+
+      const report = await cleanupOpenNextR2Cache({ bucket, currentBuildId: 'cur', now: NOW })
+
+      expect(report.aborted).toBeUndefined()
+      expect(JSON.parse(bucket.objects.get(STATE_KEY)?.body ?? '{}').progress).toBeUndefined()
+    })
   })
 })

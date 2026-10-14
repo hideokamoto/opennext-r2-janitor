@@ -38,6 +38,7 @@ export class FakeBucket implements R2BucketLike {
       }
     }
     const start = options.cursor ? Number(options.cursor) : 0
+    if (!Number.isInteger(start)) throw new Error(`invalid cursor: ${options.cursor}`)
     const page = entries.slice(start, start + limit)
     const truncated = start + limit < entries.length
     return {

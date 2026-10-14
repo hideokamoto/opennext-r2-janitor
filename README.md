@@ -30,7 +30,9 @@ Safety rails:
 - **Dry run by default.** Nothing is deleted until you pass `dryRun: false`.
 - **Aborts if the current build ID is not in the bucket.** That means a wrong prefix or a wrong build ID, so nothing is touched.
 - **Aborts on an unexpected layout.** If any object sits directly under the prefix instead of in a `<buildId>/` folder, the run stops. This guards against a future OpenNext key format change.
-- **Bounded per run.** At most `maxSubrequests` R2 calls per run (default 40, under the Workers Free plan limit of 50 subrequests). When the budget runs out, the next run resumes where this one stopped.
+- **Refuses an unreadable state object.** The state records which builds were recently current. If it exists but cannot be parsed, the run aborts instead of treating it as empty, because that could delete a build that should have been kept.
+- **All or nothing per build.** A build's whole folder is listed before anything in it is deleted, so a build with a single recent object is left untouched. The delete phase checks every page again.
+- **Bounded per run.** At most `maxSubrequests` R2 calls per run (default 40, under the Workers Free plan limit of 50 subrequests). When the budget runs out, the progress (the list cursor, or how far deletion got) is saved in the state object and the next run continues from it, so a build folder of any size is eventually handled.
 
 ## Install
 
@@ -140,8 +142,8 @@ All sites share one invocation's subrequest limit, and each `fetchBuildIdFromSit
 | `prefix` | `'incremental-cache'` | Must match `NEXT_INC_CACHE_R2_PREFIX` if the site sets it. |
 | `keepDays` | `14` | Retention window for recently current and recently written builds. |
 | `dryRun` | `true` | Report only; delete nothing. |
-| `maxSubrequests` | `40` | Upper bound on R2 calls per run. |
-| `stateKey` | `'opennext-r2-janitor/state.json'` | Where the janitor keeps its state; must be outside `prefix`. `null` disables it. |
+| `maxSubrequests` | `40` | Upper bound on R2 calls per run. At least 5 (3 with `stateKey: null`): below that a delete round cannot fit after the per-run bookkeeping and a big build would never progress, so it is rejected. |
+| `stateKey` | `'opennext-r2-janitor/state.json'` | Where the janitor keeps its state; must be outside `prefix`. `null` disables it, but then nothing is remembered between runs: rollback protection relies on upload times only, and a build that does not fit in one run is never finished. |
 
 ## The report
 
@@ -158,7 +160,9 @@ All sites share one invocation's subrequest limit, and each `fetchBuildIdFromSit
 }
 ```
 
-`aborted` is present, with a `reason` of `invalid-build-id`, `current-build-not-found` or `unexpected-layout`, when the run refused to delete anything. `pending: true` means the budget ran out and the next run continues.
+`aborted` is present, with a `reason` of `invalid-build-id`, `current-build-not-found`, `unexpected-layout` or `unreadable-state`, when the run refused to delete anything. For `unreadable-state`, look at the state object and delete it to start over (the retention history is lost, so keep the dry run on for a few days afterwards).
+
+`pending: true` means the budget ran out and the next run continues; `partial` then names the build being scanned or deleted and how many objects were covered so far. `deleted[].objects` counts the whole build, including what earlier runs already removed.
 
 ## Rolling it out
 
@@ -169,7 +173,7 @@ All sites share one invocation's subrequest limit, and each `fetchBuildIdFromSit
 ## Limitations
 
 - **Depends on OpenNext's key layout.** The `<prefix>/<buildId>/…` structure is an implementation detail of `@opennextjs/cloudflare` (`computeCacheKey`, verified against 1.19.11), not a public API. The layout check makes the janitor stop rather than guess if it changes.
-- **Large build folders.** A build is only deleted after all of its objects have been listed (any recent object keeps it). Listing and deleting share the budget, so with the default of 40 a folder of up to roughly 35,000 objects is removed over several runs; raise `maxSubrequests` for larger ones.
+- **Large build folders take several runs.** Scanning costs one list call per 1,000 objects and deleting another two (list and delete) per 1,000, so with the default budget a folder of roughly 12,000 objects is handled in one run and larger ones over as many runs as they need. Folders of at most 1,000 objects cost two calls.
 - **Free plan CPU.** Cron invocations on Workers Free get 10 ms of CPU time. This has not been measured for large buckets; if runs are cut off, lower `maxSubrequests`.
 - **Builds from before the janitor was installed** have no state entry, so they are kept only if they were written to within `keepDays`. Check the first dry-run report for builds you may still want to roll back to.
 

@@ -1,7 +1,8 @@
 import { isValidBuildId } from './buildId.js'
-import { loadState, saveState } from './state.js'
+import { InvalidStateError, loadState, saveState } from './state.js'
 import type {
   AbortReason,
+  BuildProgress,
   CleanupOptions,
   CleanupReport,
   JanitorState,
@@ -11,8 +12,13 @@ import type {
 } from './types.js'
 
 const DAY_MS = 24 * 60 * 60 * 1000
-// R2's delete() accepts at most 1000 keys per call.
-const DELETE_BATCH = 1000
+// R2's list() returns and delete() accepts at most 1000 keys per call.
+const PAGE = 1000
+
+// Bookkeeping per run: build list (1) and, with a state object, its read (1) and write (1);
+// plus one delete round: list (1) and delete (1).
+const MIN_SUBREQUESTS_WITHOUT_STATE = 3
+const MIN_SUBREQUESTS_WITH_STATE = 5
 
 class BudgetExhausted extends Error {}
 
@@ -40,15 +46,19 @@ export function normalizePrefix(prefix: string): string {
 /**
  * Deletes incremental cache entries of builds that are no longer served.
  *
- * Every build ID found under the prefix is judged on its own, so a run that hits the
- * subrequest budget can stop anywhere and the next run resumes from there:
+ * Every build ID found under the prefix is judged on its own:
  * - the current build is always kept;
  * - a build seen as current within `keepDays` (from the state object) is kept;
- * - a build with any object uploaded within `keepDays` is kept;
+ * - a build with any object uploaded within `keepDays` is kept, found by scanning its whole folder
+ *   before anything in it is deleted;
  * - anything else is deleted.
  *
- * Nothing is deleted when the layout under the prefix is not what OpenNext produces, or when
- * the current build ID does not exist in the bucket (a sign of a wrong prefix or build ID).
+ * A run stops when it has used its subrequest budget and the next run continues from the saved
+ * progress, so a build folder of any size is eventually handled.
+ *
+ * Nothing is deleted when the layout under the prefix is not what OpenNext produces, when the
+ * current build ID does not exist in the bucket (a sign of a wrong prefix or build ID), or when the
+ * state object exists but cannot be read.
  */
 export async function cleanupOpenNextR2Cache(options: CleanupOptions): Promise<CleanupReport> {
   const prefix = normalizePrefix(options.prefix ?? 'incremental-cache')
@@ -65,10 +75,15 @@ export async function cleanupOpenNextR2Cache(options: CleanupOptions): Promise<C
   if (stateKey?.startsWith(prefix)) {
     throw new Error(`stateKey "${stateKey}" must not be inside the cache prefix "${prefix}"`)
   }
-  // Reserve one subrequest for writing the state at the end.
+  // One subrequest is reserved for writing the state at the end. Below the minimum, a run spends
+  // everything on bookkeeping and a delete round (one list plus one delete) never fits, so a big
+  // build would never make progress.
   const reserved = stateKey === null ? 0 : 1
-  if (maxSubrequests < reserved + 2) {
-    throw new Error(`maxSubrequests must be at least ${reserved + 2}`)
+  const minimum = stateKey === null ? MIN_SUBREQUESTS_WITHOUT_STATE : MIN_SUBREQUESTS_WITH_STATE
+  if (maxSubrequests < minimum) {
+    throw new Error(
+      `maxSubrequests must be at least ${minimum}${stateKey === null ? '' : ' with a state object'}`,
+    )
   }
 
   const budget = new Budget(maxSubrequests - reserved)
@@ -95,7 +110,10 @@ export async function cleanupOpenNextR2Cache(options: CleanupOptions): Promise<C
   let state: JanitorState
   let buildIds: string[]
   try {
-    state = stateKey === null ? emptyState() : await budget.call(() => loadState(bucket, stateKey))
+    state =
+      stateKey === null
+        ? { version: 1, lastSeenCurrent: {} }
+        : await budget.call(() => loadState(bucket, stateKey))
     const listing = await listBuildIds(bucket, budget, prefix)
     if (listing.strayKey !== undefined) {
       return abort(
@@ -105,6 +123,9 @@ export async function cleanupOpenNextR2Cache(options: CleanupOptions): Promise<C
     }
     buildIds = listing.buildIds
   } catch (e) {
+    if (e instanceof InvalidStateError) {
+      return abort('unreadable-state', `${e.message}; delete the object to start over`)
+    }
     if (!(e instanceof BudgetExhausted)) throw e
     // Not even the build list fit in the budget; nothing was judged, so nothing changes.
     report.pending = true
@@ -126,36 +147,40 @@ export async function cleanupOpenNextR2Cache(options: CleanupOptions): Promise<C
   for (const id of Object.keys(state.lastSeenCurrent)) {
     if (!buildIds.includes(id)) delete state.lastSeenCurrent[id]
   }
+  if (state.progress && !buildIds.includes(state.progress.buildId)) state.progress = undefined
 
   let lastCompleted: string | undefined
   try {
-    for (const buildId of rotate(buildIds, state.resumeAfter)) {
+    for (const buildId of visitOrder(buildIds, state)) {
       if (buildId === currentBuildId) {
         report.kept.push({ buildId, reason: 'current' })
+        dropProgress(state, buildId)
       } else if (Date.parse(state.lastSeenCurrent[buildId] ?? '') >= cutoff) {
         report.kept.push({ buildId, reason: 'recently-current' })
+        dropProgress(state, buildId)
       } else {
-        const keys = await collectKeysIfStale(bucket, budget, `${prefix}${buildId}/`, cutoff)
-        if (keys === null) {
-          report.kept.push({ buildId, reason: 'recently-written' })
-        } else {
-          if (!dryRun) {
-            for (let i = 0; i < keys.length; i += DELETE_BATCH) {
-              const batch = keys.slice(i, i + DELETE_BATCH)
-              await budget.call(() => bucket.delete(batch))
-            }
-          }
-          report.deleted.push({ buildId, objects: keys.length })
-        }
+        await sweepBuild({ bucket, budget, prefix, cutoff, dryRun, state, report }, buildId)
       }
       lastCompleted = buildId
     }
     state.resumeAfter = undefined
   } catch (e) {
-    if (!(e instanceof BudgetExhausted)) throw e
-    // Resume after the last fully handled build; a partly deleted one is simply re-examined.
-    report.pending = true
-    state.resumeAfter = lastCompleted ?? state.resumeAfter
+    if (e instanceof BudgetExhausted) {
+      report.pending = true
+      // Resume after the last fully handled build; the unfinished one is picked up from its progress.
+      state.resumeAfter = lastCompleted ?? state.resumeAfter
+      if (state.progress) {
+        const { buildId, phase, objects } = state.progress
+        report.partial = { buildId, phase, objects }
+      }
+    } else {
+      // A saved cursor that no longer works would fail every run; start the build over next time.
+      if (stateKey !== null && state.progress?.cursor !== undefined) {
+        state.progress = undefined
+        await saveState(bucket, stateKey, state)
+      }
+      throw e
+    }
   }
 
   if (stateKey !== null) {
@@ -166,22 +191,95 @@ export async function cleanupOpenNextR2Cache(options: CleanupOptions): Promise<C
   return report
 }
 
-function emptyState(): JanitorState {
-  return { version: 1, lastSeenCurrent: {} }
+interface SweepContext {
+  bucket: R2BucketLike
+  budget: Budget
+  prefix: string
+  cutoff: number
+  dryRun: boolean
+  state: JanitorState
+  report: CleanupReport
 }
 
-async function listAll(
-  bucket: R2BucketLike,
-  budget: Budget,
-  options: R2ListOptionsLike,
-  onPage: (page: R2ObjectsLike) => boolean | undefined,
-): Promise<void> {
-  let cursor: string | undefined
-  do {
-    const page = await budget.call(() => bucket.list({ ...options, cursor, limit: 1000 }))
-    if (onPage(page) === false) return
-    cursor = page.truncated ? page.cursor : undefined
-  } while (cursor)
+/**
+ * Scans one stale-looking build, then deletes it. The scan covers the whole folder first so that a
+ * build with a single recent object is left untouched instead of being half emptied. The delete
+ * phase checks every page again, so an object written in the meantime also stops it.
+ */
+async function sweepBuild(ctx: SweepContext, buildId: string): Promise<void> {
+  const { bucket, budget, prefix, cutoff, dryRun, state, report } = ctx
+  const folder = `${prefix}${buildId}/`
+  const isRecent = (page: R2ObjectsLike) => page.objects.some((o) => o.uploaded.getTime() >= cutoff)
+
+  let progress: BuildProgress =
+    state.progress?.buildId === buildId && !(dryRun && state.progress.phase === 'delete')
+      ? state.progress
+      : { buildId, phase: 'scan', objects: 0 }
+  state.progress = progress
+
+  if (progress.phase === 'scan') {
+    // A folder that fits in one page is already fully known after the first list call.
+    let firstPage = progress.cursor === undefined && progress.objects === 0
+    for (;;) {
+      const page: R2ObjectsLike = await budget.call(() =>
+        bucket.list({ prefix: folder, cursor: progress.cursor, limit: PAGE }),
+      )
+      if (isRecent(page)) {
+        report.kept.push({ buildId, reason: 'recently-written' })
+        state.progress = undefined
+        return
+      }
+      if (firstPage && !page.truncated) {
+        if (!dryRun && page.objects.length > 0) {
+          const keys = page.objects.map((o) => o.key)
+          await budget.call(() => bucket.delete(keys))
+        }
+        report.deleted.push({ buildId, objects: page.objects.length })
+        state.progress = undefined
+        return
+      }
+      firstPage = false
+      progress = {
+        buildId,
+        phase: 'scan',
+        cursor: page.truncated ? page.cursor : undefined,
+        objects: progress.objects + page.objects.length,
+      }
+      state.progress = progress
+      if (!page.truncated) break
+    }
+    if (dryRun) {
+      report.deleted.push({ buildId, objects: progress.objects })
+      state.progress = undefined
+      return
+    }
+    progress = { buildId, phase: 'delete', objects: 0 }
+    state.progress = progress
+  }
+
+  // Deleted keys disappear from the listing, so each round simply lists from the start again.
+  for (;;) {
+    const page: R2ObjectsLike = await budget.call(() =>
+      bucket.list({ prefix: folder, limit: PAGE }),
+    )
+    if (page.objects.length === 0) break
+    if (isRecent(page)) {
+      report.kept.push({ buildId, reason: 'recently-written' })
+      state.progress = undefined
+      return
+    }
+    const keys = page.objects.map((o) => o.key)
+    await budget.call(() => bucket.delete(keys))
+    progress = { ...progress, objects: progress.objects + keys.length }
+    state.progress = progress
+    if (!page.truncated) break // that page held the rest of the folder
+  }
+  report.deleted.push({ buildId, objects: progress.objects })
+  state.progress = undefined
+}
+
+function dropProgress(state: JanitorState, buildId: string): void {
+  if (state.progress?.buildId === buildId) state.progress = undefined
 }
 
 async function listBuildIds(
@@ -190,44 +288,29 @@ async function listBuildIds(
   prefix: string,
 ): Promise<{ buildIds: string[]; strayKey?: string }> {
   const buildIds: string[] = []
-  let strayKey: string | undefined
-  await listAll(bucket, budget, { prefix, delimiter: '/' }, (page) => {
-    if (page.objects.length > 0) {
-      strayKey = page.objects[0]?.key
-      return false
-    }
+  let cursor: string | undefined
+  do {
+    const options: R2ListOptionsLike = { prefix, delimiter: '/', cursor, limit: PAGE }
+    const page: R2ObjectsLike = await budget.call(() => bucket.list(options))
+    if (page.objects.length > 0) return { buildIds, strayKey: page.objects[0]?.key }
     for (const p of page.delimitedPrefixes) buildIds.push(p.slice(prefix.length).replace(/\/$/, ''))
-    return true
-  })
-  return { buildIds: buildIds.sort(), strayKey }
+    cursor = page.truncated ? page.cursor : undefined
+  } while (cursor)
+  return { buildIds: buildIds.sort() }
 }
 
-/** Returns every key under `folder`, or `null` as soon as one was uploaded at or after `cutoff`. */
-async function collectKeysIfStale(
-  bucket: R2BucketLike,
-  budget: Budget,
-  folder: string,
-  cutoff: number,
-): Promise<string[] | null> {
-  const keys: string[] = []
-  let recent = false
-  await listAll(bucket, budget, { prefix: folder }, (page) => {
-    for (const obj of page.objects) {
-      if (obj.uploaded.getTime() >= cutoff) {
-        recent = true
-        return false
-      }
-      keys.push(obj.key)
-    }
-    return true
-  })
-  return recent ? null : keys
-}
-
-/** Starts the iteration after `resumeAfter`, wrapping around, so successive runs make progress. */
-function rotate(sortedIds: string[], resumeAfter: string | undefined): string[] {
-  if (resumeAfter === undefined) return sortedIds
-  const start = sortedIds.findIndex((id) => id > resumeAfter)
-  if (start <= 0) return sortedIds
-  return [...sortedIds.slice(start), ...sortedIds.slice(0, start)]
+/**
+ * Starts after `resumeAfter` and wraps around, so successive runs make progress; a build with
+ * saved progress goes first.
+ */
+function visitOrder(sortedIds: string[], state: JanitorState): string[] {
+  const { resumeAfter, progress } = state
+  let ids = sortedIds
+  if (resumeAfter !== undefined) {
+    const start = sortedIds.findIndex((id) => id > resumeAfter)
+    if (start > 0) ids = [...sortedIds.slice(start), ...sortedIds.slice(0, start)]
+  }
+  return progress && ids.includes(progress.buildId)
+    ? [progress.buildId, ...ids.filter((id) => id !== progress.buildId)]
+    : ids
 }
