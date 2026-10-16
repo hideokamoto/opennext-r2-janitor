@@ -106,7 +106,7 @@ export interface JanitorState {
 }
 
 /**
- * A build is handled in two phases so that it is either deleted whole or not at all:
+ * A build is handled in two phases so that nothing is deleted before the whole folder has been checked:
  * - `scan` lists the folder page by page and gives up as soon as it sees a recently written object;
  * - `delete` runs once a full scan found nothing recent, and removes the folder 1000 keys at a time.
  */
